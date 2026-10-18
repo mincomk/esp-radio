@@ -1652,9 +1652,18 @@ static TX_LAST_DONE_MS: AtomicU32 = AtomicU32::new(0);
 /// in-flight counter is treated as leaked rather than busy.
 ///
 /// A frame on the air at 50 Hz completes in about a millisecond, and even a
-/// frame the chip retries at 1 Mbit/s finishes inside 20 ms, so a `queue` of
-/// three frames that reports nothing for this long is not busy -- it is stuck.
-const TX_DONE_TIMEOUT_MS: u32 = 50;
+/// frame the chip retries at 1 Mbit/s finishes inside 20 ms -- but a link can go
+/// quiet without disassociating: measured on the hovering bench, 2.4 GHz airtime
+/// gaps of 0.1 to 2 s arrive with the station still associated, no
+/// `StaDisconnected`, and every queued frame simply waiting.
+///
+/// The timeout has to sit above those gaps, not above the nominal frame time.
+/// At 50 ms every such gap cleared the counter, the caller pushed another frame
+/// into a driver whose buffers were still held, and the driver answered
+/// `ESP_ERR_NO_MEM`: the "recovery" was the largest source of dropped frames on
+/// that link. 500 ms is ten times the longest normal completion and still
+/// repairs a genuinely leaked slot within half a second.
+const TX_DONE_TIMEOUT_MS: u32 = 500;
 
 /// Counters for the transmit path.
 ///
