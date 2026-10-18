@@ -70,7 +70,7 @@ use esp_wifi_sys::{
 use num_derive::FromPrimitive;
 #[doc(hidden)]
 pub(crate) use os_adapter::*;
-use portable_atomic::{AtomicUsize, Ordering};
+use portable_atomic::{AtomicU32, AtomicUsize, Ordering};
 use procmacros::BuilderLite;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -1637,6 +1637,97 @@ unsafe extern "C" fn recv_cb_ap(
 
 pub(crate) static WIFI_TX_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
+/// Frames handed to `esp_wifi_internal_tx`.
+static TX_QUEUED: AtomicU32 = AtomicU32::new(0);
+/// Completions reported through `esp_wifi_tx_done_cb`.
+static TX_COMPLETED: AtomicU32 = AtomicU32::new(0);
+/// Frames the driver refused (`esp_wifi_internal_tx` returned an error).
+static TX_FAILED: AtomicU32 = AtomicU32::new(0);
+/// Times the in-flight counter was found leaked and cleared.
+static TX_RECOVERIES: AtomicU32 = AtomicU32::new(0);
+/// Milliseconds since boot at the last completion callback.
+static TX_LAST_DONE_MS: AtomicU32 = AtomicU32::new(0);
+
+/// How long every queue slot may stay taken with no completion before the
+/// in-flight counter is treated as leaked rather than busy.
+///
+/// A frame on the air at 50 Hz completes in about a millisecond, and even a
+/// frame the chip retries at 1 Mbit/s finishes inside 20 ms, so a `queue` of
+/// three frames that reports nothing for this long is not busy -- it is stuck.
+const TX_DONE_TIMEOUT_MS: u32 = 50;
+
+/// Counters for the transmit path.
+///
+/// `esp_wifi_tx_done_cb` is the only thing that returns a queue slot, and it
+/// does not fire for every frame handed to the driver: a missed callback costs
+/// a slot for the rest of the boot. These counters are what tells "the radio is
+/// busy" apart from "the radio has lost track of its own queue".
+#[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct TxStats {
+    /// Frames handed to the driver since boot.
+    pub queued: u32,
+    /// Completions reported back since boot.
+    pub completed: u32,
+    /// Frames the driver refused (no buffer, interface down).
+    pub failed: u32,
+    /// Slots currently believed to be in flight.
+    pub inflight: usize,
+    /// Slots the queue is configured with.
+    pub limit: usize,
+    /// Times the in-flight counter was found leaked and cleared.
+    pub recoveries: u32,
+    /// Milliseconds since the last completion callback.
+    pub ms_since_done: u32,
+}
+
+/// Snapshot of the transmit-path counters.
+pub fn tx_stats() -> TxStats {
+    let now = now_ms();
+    TxStats {
+        queued: TX_QUEUED.load(Ordering::Relaxed),
+        completed: TX_COMPLETED.load(Ordering::Relaxed),
+        failed: TX_FAILED.load(Ordering::Relaxed),
+        inflight: WIFI_TX_INFLIGHT.load(Ordering::Relaxed),
+        limit: TX_QUEUE_SIZE.load(Ordering::Relaxed),
+        recoveries: TX_RECOVERIES.load(Ordering::Relaxed),
+        ms_since_done: now.wrapping_sub(TX_LAST_DONE_MS.load(Ordering::Relaxed)),
+    }
+}
+
+fn now_ms() -> u32 {
+    esp_hal::time::Instant::now()
+        .duration_since_epoch()
+        .as_millis() as u32
+}
+
+/// Reclaim the queue from a completion callback the driver never delivered.
+///
+/// Returns `true` when a slot is available afterwards, either because one was
+/// free already or because the counter was leaked and has been cleared. Clearing
+/// it can let one or two more frames into a driver that really is busy; the
+/// driver then answers `esp_wifi_internal_tx` with an error and the frame is
+/// dropped, which is a retransmission rather than a dead transmitter.
+fn reclaim_inflight_if_stalled() -> bool {
+    let limit = TX_QUEUE_SIZE.load(Ordering::Relaxed);
+    if WIFI_TX_INFLIGHT.load(Ordering::SeqCst) < limit {
+        return true;
+    }
+
+    let stalled_for = now_ms().wrapping_sub(TX_LAST_DONE_MS.load(Ordering::Relaxed));
+    if stalled_for < TX_DONE_TIMEOUT_MS {
+        return false;
+    }
+
+    let leaked = WIFI_TX_INFLIGHT.swap(0, Ordering::SeqCst);
+    TX_RECOVERIES.fetch_add(1, Ordering::Relaxed);
+    warn!(
+        "wifi tx queue wedged: {} of {} slots taken, no completion for {} ms; cleared",
+        leaked, limit, stalled_for
+    );
+    true
+}
+
 fn decrement_inflight_counter() {
     unwrap!(
         WIFI_TX_INFLIGHT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
@@ -1653,6 +1744,9 @@ unsafe extern "C" fn esp_wifi_tx_done_cb(
     _tx_status: bool,
 ) {
     trace!("esp_wifi_tx_done_cb");
+
+    TX_COMPLETED.fetch_add(1, Ordering::Relaxed);
+    TX_LAST_DONE_MS.store(now_ms(), Ordering::Relaxed);
 
     decrement_inflight_counter();
 
@@ -1873,6 +1967,7 @@ impl WifiDeviceMode {
     }
 
     fn increase_in_flight_counter(&self) {
+        TX_QUEUED.fetch_add(1, Ordering::Relaxed);
         WIFI_TX_INFLIGHT.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -1880,6 +1975,10 @@ impl WifiDeviceMode {
         if !self.can_send() {
             // TODO: perhaps we can use a counting semaphore with a short blocking timeout
             crate::preempt::yield_task();
+        }
+
+        if !self.can_send() && !reclaim_inflight_if_stalled() {
+            return None;
         }
 
         if self.can_send() {
@@ -2415,6 +2514,7 @@ pub(crate) fn esp_wifi_send_data(interface: wifi_interface_t, data: &mut [u8]) {
     let res = unsafe { esp_wifi_internal_tx(interface, ptr, len) };
 
     if res != 0 {
+        TX_FAILED.fetch_add(1, Ordering::Relaxed);
         warn!("esp_wifi_internal_tx {}", res);
         decrement_inflight_counter();
     } else {
@@ -2881,6 +2981,7 @@ pub fn new<'d>(
 
         RX_QUEUE_SIZE.store(config.rx_queue_size, Ordering::Relaxed);
         TX_QUEUE_SIZE.store(config.tx_queue_size, Ordering::Relaxed);
+        TX_LAST_DONE_MS.store(now_ms(), Ordering::Relaxed);
     };
 
     crate::wifi::wifi_init(device)?;
